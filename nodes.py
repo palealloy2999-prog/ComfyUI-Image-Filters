@@ -312,7 +312,9 @@ class ImageMatting:
         
         i_dup = images.cpu().numpy().astype(np.float64)
         a_dup = trimap.cpu().numpy().astype(np.float64)
-        if a_dup.ndim == 2:
+        if a_dup.size == 0 or (a_dup.ndim > 0 and a_dup.shape[0] == 0):
+            a_dup = np.zeros((i_dup.shape[0], i_dup.shape[1], i_dup.shape[2]), dtype=np.float64)
+        elif a_dup.ndim == 2:
             a_dup = np.expand_dims(a_dup, axis=0)
         if a_dup.shape[0] == 1 and i_dup.shape[0] > 1:
             a_dup = np.repeat(a_dup, i_dup.shape[0], axis=0)
