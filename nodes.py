@@ -312,6 +312,14 @@ class ImageMatting:
         
         i_dup = images.cpu().numpy().astype(np.float64)
         a_dup = trimap.cpu().numpy().astype(np.float64)
+        if a_dup.ndim == 2:
+            a_dup = np.expand_dims(a_dup, axis=0)
+        if a_dup.shape[0] == 1 and i_dup.shape[0] > 1:
+            a_dup = np.repeat(a_dup, i_dup.shape[0], axis=0)
+        elif a_dup.shape[0] != i_dup.shape[0]:
+            raise ValueError(
+                f"ImageMatting expected trimap batch size 1 or {i_dup.shape[0]}, got {a_dup.shape[0]}"
+            )
         fg = copy.deepcopy(i_dup)
         bg = copy.deepcopy(i_dup)
         
