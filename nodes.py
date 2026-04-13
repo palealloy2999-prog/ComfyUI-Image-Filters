@@ -135,6 +135,66 @@ def randn_like_g(x, generator=None):
     return r.to(x.device)
 
 
+def _ensure_mask_batch(mask_array: np.ndarray, image_batch_size: int, height: int, width: int) -> np.ndarray:
+    if mask_array.size == 0 or (mask_array.ndim > 0 and mask_array.shape[0] == 0):
+        return np.zeros((image_batch_size, height, width), dtype=np.float64)
+    if mask_array.ndim == 2:
+        mask_array = np.expand_dims(mask_array, axis=0)
+    if mask_array.shape[0] == 1 and image_batch_size > 1:
+        mask_array = np.repeat(mask_array, image_batch_size, axis=0)
+    elif mask_array.shape[0] != image_batch_size:
+        raise ValueError(
+            f"ImageMatting expected trimap batch size 1 or {image_batch_size}, got {mask_array.shape[0]}"
+        )
+    return mask_array
+
+
+def _prepare_trimap(raw_trimap: np.ndarray, preblur: int, blackpoint: float, whitepoint: float) -> np.ndarray:
+    trimap = raw_trimap
+    if trimap.ndim == 3:
+        trimap = trimap[:, :, 0]
+
+    trimap = np.clip(trimap.astype(np.float64), 0.0, 1.0)
+
+    if preblur > 0:
+        d = preblur * 2 + 1
+        trimap = cv2.GaussianBlur(trimap, (d, d), 0)
+
+    trimap = fix_trimap(trimap, blackpoint, whitepoint)
+
+    has_bg = np.any(trimap <= 0.0)
+    has_fg = np.any(trimap >= 1.0)
+
+    if not has_bg:
+        min_pos = np.unravel_index(np.argmin(raw_trimap), trimap.shape)
+        trimap[min_pos] = 0.0
+
+    if not has_fg:
+        max_pos = np.unravel_index(np.argmax(raw_trimap), trimap.shape)
+        trimap[max_pos] = 1.0
+
+    if not np.any(trimap <= 0.0):
+        trimap[0, 0] = 0.0
+
+    if not np.any(trimap >= 1.0):
+        trimap[-1, -1] = 1.0
+
+    return trimap
+
+
+def _estimate_alpha_with_fallback(image: np.ndarray, trimap: np.ndarray, max_iterations: int) -> np.ndarray:
+    try:
+        return estimate_alpha_cf(
+            image,
+            trimap,
+            laplacian_kwargs={"epsilon": 1e-6},
+            cg_kwargs={"maxiter": max_iterations},
+        )
+    except ValueError as error:
+        print(f"\033[33mComfyUI-Image-Filters: falling back to fixed trimap after matting failure: {error}\033[m")
+        return np.clip(trimap, 0.0, 1.0)
+
+
 class AlphaClean:
     @classmethod
     def INPUT_TYPES(s):
@@ -259,8 +319,6 @@ class AlphaMatte:
     DEPRECATED = True
 
     def alpha_matte(self, images, alpha_trimap, preblur, blackpoint, whitepoint, max_iterations, estimate_fg):
-        d = preblur * 2 + 1
-        
         i_dup = images.cpu().numpy().astype(np.float64)
         a_dup = alpha_trimap.cpu().numpy().astype(np.float64)
         fg = images.cpu().numpy().astype(np.float64)
@@ -268,12 +326,8 @@ class AlphaMatte:
         
         
         for index, image in enumerate(i_dup):
-            trimap = a_dup[index][:,:,0] # convert to single channel
-            if preblur > 0:
-                trimap = cv2.GaussianBlur(trimap, (d, d), 0)
-            trimap = fix_trimap(trimap, blackpoint, whitepoint)
-            
-            alpha = estimate_alpha_cf(image, trimap, laplacian_kwargs={"epsilon": 1e-6}, cg_kwargs={"maxiter":max_iterations})
+            trimap = _prepare_trimap(a_dup[index], preblur, blackpoint, whitepoint)
+            alpha = _estimate_alpha_with_fallback(image, trimap, max_iterations)
             
             if estimate_fg == "true":
                 fg[index], bg[index] = estimate_foreground_ml(image, alpha, return_background=True)
@@ -308,31 +362,20 @@ class ImageMatting:
     CATEGORY = "Image-Filters/image"
 
     def alpha_matte(self, images, trimap, preblur, blackpoint, whitepoint, max_iterations, estimate_fg):
-        d = preblur * 2 + 1
-        
         i_dup = images.cpu().numpy().astype(np.float64)
-        a_dup = trimap.cpu().numpy().astype(np.float64)
-        if a_dup.size == 0 or (a_dup.ndim > 0 and a_dup.shape[0] == 0):
-            a_dup = np.zeros((i_dup.shape[0], i_dup.shape[1], i_dup.shape[2]), dtype=np.float64)
-        elif a_dup.ndim == 2:
-            a_dup = np.expand_dims(a_dup, axis=0)
-        if a_dup.shape[0] == 1 and i_dup.shape[0] > 1:
-            a_dup = np.repeat(a_dup, i_dup.shape[0], axis=0)
-        elif a_dup.shape[0] != i_dup.shape[0]:
-            raise ValueError(
-                f"ImageMatting expected trimap batch size 1 or {i_dup.shape[0]}, got {a_dup.shape[0]}"
-            )
+        a_dup = _ensure_mask_batch(
+            trimap.cpu().numpy().astype(np.float64),
+            i_dup.shape[0],
+            i_dup.shape[1],
+            i_dup.shape[2],
+        )
         fg = copy.deepcopy(i_dup)
         bg = copy.deepcopy(i_dup)
         
         
         for index, image in enumerate(i_dup):
-            trimap = a_dup[index]
-            if preblur > 0:
-                trimap = cv2.GaussianBlur(trimap, (d, d), 0)
-            trimap = fix_trimap(trimap, blackpoint, whitepoint)
-            
-            alpha = estimate_alpha_cf(image, trimap, laplacian_kwargs={"epsilon": 1e-6}, cg_kwargs={"maxiter":max_iterations})
+            trimap = _prepare_trimap(a_dup[index], preblur, blackpoint, whitepoint)
+            alpha = _estimate_alpha_with_fallback(image, trimap, max_iterations)
             
             if estimate_fg:
                 fg[index], bg[index] = estimate_foreground_ml(image, alpha, return_background=True)
